@@ -20,6 +20,8 @@ ifile = open("solarmarker.malz",'r+b')
 text = ifile.read()
 #close file after its contents read into a variable string
 ifile.close()
+
+#create new file for the extracted dll
 f = open("solarmarker.dll", "wb")
 
 aeskey = ''
