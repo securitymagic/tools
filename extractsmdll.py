@@ -14,7 +14,7 @@ aeskeyfind = re.compile('](\d{1,3}\,){31}\d{1,3}\)')
 aesivfind = re.compile('](\d{1,3}\,){15}\d{1,3}\)')
 aesb64find = re.compile('([A-Za-z0-9+=/]{1000,})', re.MULTILINE)
 
-#open file
+#open malware installer/dropper
 ifile = open("solarmarker.malz",'r+b')
 # Read file object to string
 text = ifile.read()
