@@ -1,9 +1,10 @@
 #This script Extracts solarmarker reflective DLL from current malware dropper campaign (started May 2023)
 #Example Installer: 01eee7bbd593b75684234d51530a87c1
-#By Lucas Acha (www.lukeacha.com)
-#Version 1.1
+#By Luke Acha (www.lukeacha.com)
+#Improvements made by Squiblydoo (Squiblydoo.blog)
+#Version 1.2
 #To-Do: Add Argparse, properly resolve extra 16 byte addition after decryption
-#July 78, 2023
+#July 9, 2023
 
 import base64  ,re
 from Crypto.Cipher import AES
@@ -17,7 +18,7 @@ aesb64find = re.compile('([A-Za-z0-9+=/]{1000,})', re.MULTILINE)
 #open malware installer/dropper
 ifile = open("solarmarker.malz",'r+b')
 # Read file object to string
-text = ifile.read()
+text = ifile.read(6000000) #change suggested by Squiblydoo
 #close file after its contents read into a variable string
 ifile.close()
 
