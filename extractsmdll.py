@@ -1,12 +1,12 @@
 #This script Extracts solarmarker reflective DLL from current malware dropper campaign (started May 2023)
-#Example Installer: 01eee7bbd593b75684234d51530a87c1
+#Example Installers: 01eee7bbd593b75684234d51530a87c1, eff4dee32ca0f188b0f6ebe24799a489
 #By Luke Acha (www.lukeacha.com)
-#Improvements made by Squiblydoo (Squiblydoo.blog)
+#Contributions by Squiblydoo (Squiblydoo.blog)
 #Version 1.2
-#To-Do: Add Argparse, properly resolve extra 16 byte addition after decryption
+#To-Do: Clean up code, investigate 16 byte padding after AES decrypt
 #July 9, 2023
 
-import base64  ,re
+import base64, re, argparse
 from Crypto.Cipher import AES
 
 #Regular Expressions to find base64 encodings and AES key/IV
@@ -15,21 +15,42 @@ aeskeyfind = re.compile('](\d{1,3}\,){31}\d{1,3}\)')
 aesivfind = re.compile('](\d{1,3}\,){15}\d{1,3}\)')
 aesb64find = re.compile('([A-Za-z0-9+=/]{1000,})', re.MULTILINE)
 
-#open malware installer/dropper
-ifile = open("solarmarker.malz",'r+b')
-# Read file object to string
-text = ifile.read(6000000) #change suggested by Squiblydoo
-#close file after its contents read into a variable string
-ifile.close()
-
-#create new file for the extracted dll
-f = open("solarmarker.dll", "wb")
-
+#variables:
 aeskey = ''
 aesiv = ''
 t = []
 l = ''
 decodedb64 = ''
+psfile = 'solarmarker.ps1'
+dllfile = 'solarmarker.dll'
+smfile = 'solarmarker.malz'
+
+parser = argparse.ArgumentParser()
+parser.add_argument('-f','--file', help='read input sample file -f <file.csv>')
+parser.add_argument('-p','--powershell', help='extract powershell script -p <outfile.ps1>')
+parser.add_argument('-d','--dll', help='extract dll file -d <dllfile.dll>')
+args = vars(parser.parse_args())
+#Command Line Branches	
+if args['powershell']:
+	psfile = args['powershell']
+if args['dll']:
+	dllfile = args['dll']
+if args['file']:
+    smfile = args['file']
+
+#open file
+try:
+    ifile = open(smfile, 'rb')
+except:
+    print('Require input file: -f <filename>')
+    exit
+# Read file object to string
+text = ifile.read(6000000) #Squiblydoo recommendation to limit bytes read to improve speed
+#close file after its contents read into a variable string
+ifile.close()
+
+f = open(dllfile, "wb")
+fp = open(psfile,'wb') 
 
 #Remove Null Bytes from file
 for x in text:
@@ -45,6 +66,9 @@ for x in b64find.finditer(l):
          decodedb64 = base64.b64decode(t)
     except:
         pass
+
+fp.write(decodedb64)
+fp.close()
 
 #Convert Base64 into UTF8 for use in matching data in the powershell script
 s = decodedb64.decode('utf-8')
@@ -94,8 +118,9 @@ key = aeskey2
 cipher = AES.new(key, AES.MODE_CBC, iv)
 smdecode = cipher.decrypt(enc)
 
-#Remove trailing 16 bytes, not sure why this gets added, will troubleshoot in the future
+#Remove trailing 16 bytes from extracted dll
 smdecode = smdecode[:-16]
 
 #Write DLL file
 f.write(smdecode)
+f.close()
