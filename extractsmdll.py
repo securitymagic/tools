@@ -46,7 +46,7 @@ except:
     exit()
 	
 # Read file object to string
-text = ifile.read(6000000) #Squiblydoo recommendation to limit bytes read to improve speed
+text = ifile.read(20000000) #Squiblydoo recommendation to limit bytes read to improve speed
 #close file after its contents read into a variable string
 ifile.close()
 
