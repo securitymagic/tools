@@ -104,7 +104,6 @@ cipher = AES.new(key, AES.MODE_CBC, iv)
 smdecode = cipher.decrypt(enc)
 #Remove trailing 16 bytes, not sure why this gets added, will troubleshoot in the future
 smdecode = smdecode[:-16]
-#dc = zlib.decompressobj(wbits=-zlib.MAX_WBITS)
 #Write DLL file
 if g == 1:
     f.write(gzip.decompress(smdecode))
