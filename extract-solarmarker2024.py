@@ -1,10 +1,11 @@
 #Extracts solarmarker DLL from current malware dropper campaign (started Jan 2024)
 #Example Installer: 88be786a58b74ecf50f88e9175705d80
 #By Lucas Acha
-#Version 1.1
-#January 16, 2024
+#Version 1.2
+#Updated to add optoin for gzip decompress for final dll payload in some versions (May 2024)
+#May 2, 2024
 
-import base64, re, argparse
+import base64, re, argparse, gzip
 from Crypto.Cipher import AES
 
 #Regular Expressions to find base64 encodings and AES key/IV
@@ -17,16 +18,20 @@ aeskey = ''
 aesiv = ''
 t = []
 l = ''
+g = 0
 decodedb64 = ''
 dllfile = 'solarmarker.dll'
 smfile = 'solarmarker.malz'
 
 parser = argparse.ArgumentParser()
-parser.add_argument('-f','--file', help='read input sample file -f <file.csv>')
+parser.add_argument('-f','--file', help='read input sample file -f <file>')
+parser.add_argument('-g','--gzip', help='Use this option to decompress the final payload for some versions of solarmarker dll', action='store_true')
 args = vars(parser.parse_args())
 #Command Line Branches	
 if args['file']:
     smfile = args['file']
+if args['gzip']:
+    g = 1
 
 #open file
 try:
@@ -99,7 +104,10 @@ cipher = AES.new(key, AES.MODE_CBC, iv)
 smdecode = cipher.decrypt(enc)
 #Remove trailing 16 bytes, not sure why this gets added, will troubleshoot in the future
 smdecode = smdecode[:-16]
-
+#dc = zlib.decompressobj(wbits=-zlib.MAX_WBITS)
 #Write DLL file
-f.write(smdecode)
+if g == 1:
+    f.write(gzip.decompress(smdecode))
+else:
+    f.write(smdecode)
 f.close()
