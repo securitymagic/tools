@@ -3,9 +3,9 @@
 #By Lucas Acha
 #Version 1.2
 #Updated to add optoin for gzip decompress for final dll payload in some versions (May 2024)
-#May 2, 2024
+#May 9, 2024
 
-import base64, re, argparse, gzip
+import base64, re, argparse, zlib
 from Crypto.Cipher import AES
 
 #Regular Expressions to find base64 encodings and AES key/IV
@@ -70,9 +70,6 @@ for x in aesivfind.finditer(l):
     aesiv = aesiv.lstrip(']')
     aesiv = aesiv.rstrip(')')
 
-#print(aesiv)
-#print(aeskey)
-
 #Match Ciphertext from Powershell Script
 aesb64 =''
 
@@ -105,8 +102,8 @@ smdecode = cipher.decrypt(enc)
 #Remove trailing 16 bytes, not sure why this gets added, will troubleshoot in the future
 smdecode = smdecode[:-16]
 #Write DLL file
+zobj = zlib.decompressobj(wbits=zlib.MAX_WBITS | 32)
 if g == 1:
-    f.write(gzip.decompress(smdecode))
+    f.write(zobj.decompress(smdecode))
 else:
     f.write(smdecode)
-f.close()
