@@ -1,8 +1,9 @@
 #Extracts solarmarker DLL from current malware dropper campaign (started Jan 2024)
-#Example Installer: 88be786a58b74ecf50f88e9175705d80
+#Example Installer: 88be786a58b74ecf50f88e9175705d80, 8681810e6e93e8fead8a415e1b38c8c2
 #By Lucas Acha
-#Version 1.2
-#Updated to add optoin for gzip decompress for final dll payload in some versions (May 2024)
+#Version 1.3
+#Updated to add optoin for zlib decompress for final dll payload in some versions (May 2024)
+#python extract-solarmarker2024.py -f <filename> -g <add the -g to attempt decompress of final payload if compressed>
 #May 9, 2024
 
 import base64, re, argparse, zlib
