@@ -1,3 +1,4 @@
+#Sample: https://app.any.run/tasks/5af1f789-d348-4172-b8c0-abae8173de84
 import base64
 
 def ror8(x, r):
@@ -66,10 +67,11 @@ def decode_blob_anylen(b64: str, expect_header: int = 0x01, verbose: bool = True
     return bytes(pt)
 
 if __name__ == "__main__":
-    b64 = "AeGNEjO25+LR5357m9I14vDl52IL"
+    b64 = "paste here"
     out = decode_blob_anylen(b64, verbose=True)
     print(out)
     try:
         print(out.decode("utf-8"))
     except UnicodeDecodeError:
+
         print(out.decode("utf-8", errors="replace"))
