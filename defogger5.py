@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Extract QuartzLine-style statically encoded endpoint fragments from an x64 PE.
+"""
+ChatGPT + Luke Acha (Version 5)
+For most cases py defogger5.py sample.exe --auto-additive
+Extract QuartzLine-style statically encoded endpoint fragments from an x64 PE.
 
 The current QuartzLine sample calls a short decoder with:
   RCX = address of encoded bytes
