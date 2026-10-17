@@ -45,6 +45,7 @@ Verified GridDesk / ReportLab profile:
   --scheme https --suffix com
 """
 
+
 from __future__ import annotations
 
 import argparse
@@ -632,6 +633,13 @@ def brute_force_additive(pe: PortableExecutable, max_windows: int = 24,
                 # random run of ASCII is much less convincing.
                 admit(offset, k, step, raw, 'exhaustive-referenced-buffer')
 
+    # Weak algebraic matches are not automatic C2 discoveries. In particular,
+    # constant-offset transforms (step=0) across existing English text give
+    # high false-positive rates. Keep only referenced-buffer exhaustive hits
+    # and structurally supported candidates in routine stdout/JSON output.
+    hits = {key: record for key, record in hits.items()
+            if record['method'] == 'exhaustive-referenced-buffer'
+            and record['key_step'] != 0}
     # Count and cap candidates rather than flooding users with noise.
     found = list(hits.values())
     found.sort(key=lambda h: (h['method'] != 'known-plaintext', -len(h['decoded']), h['encoded_va']))
@@ -684,6 +692,244 @@ def plaintext_urls(pe: PortableExecutable) -> list[str]:
     return sorted(matches)
 
 
+def packed_plaintext_artifacts(pe: PortableExecutable) -> list[dict]:
+    """Find bounded plaintext domain and path *fragments* in packed Rust data.
+
+    Does not synthesize or claim URLs: adjacent Rust literals may lack NUL
+    delimiters and may not represent a single string. Report precise offsets.
+    """
+    domain_re = re.compile(rb"(?<![A-Za-z0-9.-])(?:[A-Za-z0-9-]{3,63}\.)+(?:com|net|org|io|co)(?![A-Za-z0-9.-])", re.I)
+    output = []
+    for sec in pe.sections:
+        if sec.characteristics & IMAGE_SCN_MEM_EXECUTE:
+            continue
+        start = sec.raw_offset
+        end = min(start + sec.raw_size, len(pe.data))
+        if not 0 <= start < end:
+            continue
+        data = pe.data[start:end]
+        for m in domain_re.finditer(data):
+            token = m.group(0).decode('ascii')
+            # Adjacent literals may form a misleading longer token. Require
+            # common DNS suffix and place a conservative bound on reporting.
+            if len(token) > 100:
+                continue
+            off = start + m.start()
+            context = pe.data[max(0,off-48):min(len(pe.data),off+96)]
+            output.append({
+                'value':token,
+                'va':f'0x{pe.offset_to_va(off):X}',
+                'file_offset':f'0x{off:X}',
+                'nearby_ascii':''.join(chr(x) if 32 <= x < 127 else '.' for x in context),
+                'status':'embedded plaintext domain candidate, NOT a decoded URL or confirmed contact',
+            })
+    return output[:100]
+
+
+
+def discover_packed_network_fragments(pe: PortableExecutable, max_anchors: int = 100) -> list[dict]:
+    """Recover short Rust string fragments from x64 RIP-relative data references.
+
+    An undecorated run of printable bytes may contain concatenated literals.
+    Separate starts backed by LEA references, and stop at another referenced
+    start or nonprintable byte. Return bounded evidence, not guessed URLs.
+    """
+    by_offset: dict[int, set[int]] = {}
+    code = pe.data
+    # RIP-relative LEA with REX.W; scan executable sections only, validate
+    # targets within non-executable file-backed sections.
+    for lo, hi in pe.executable_ranges():
+        for off in range(lo, hi - 7):
+            if code[off] not in (0x48, 0x4c) or code[off + 1] != 0x8d:
+                continue
+            if (code[off + 2] & 0xc7) != 0x05:  # RIP-relative ModRM
+                continue
+            va = pe.offset_to_va(off) + 7 + struct.unpack_from('<i', code, off+3)[0]
+            try:
+                target = pe.va_to_offset(va)
+            except PEFormatError:
+                continue
+            if any(sec.raw_offset <= target < sec.raw_offset + sec.raw_size
+                   and not (sec.characteristics & IMAGE_SCN_MEM_EXECUTE)
+                   for sec in pe.sections):
+                by_offset.setdefault(target, set()).add(pe.offset_to_va(off))
+    starts = sorted(by_offset)
+    import bisect
+    output = []
+    for i, off in enumerate(starts):
+        if not (65 <= code[off] <= 90 or 97 <= code[off] <= 122):
+            continue
+        # A packed Rust literal may have no terminator before the next string.
+        next_start = starts[i+1] if i+1 < len(starts) else off+72
+        cap = min(next_start, off+72, len(code))
+        end = off
+        while end < cap and (65 <= code[end] <= 90 or 97 <= code[end] <= 122 or
+                             48 <= code[end] <= 57 or code[end] in (45,46,47,95)):
+            end += 1
+        if end-off < 4:
+            continue
+        value = code[off:end].decode('ascii')
+        # Compiler source marker is often glued to the preceding fragment.
+        # Backslash terminates our restricted token scan; trim the trailing
+        # 'src' if the following bytes are a source file path.
+        if value.endswith('src') and (code[end:end+1] == b'\\' or code[end:end+1] == b'/'):
+            value = value[:-3]
+            end -= 3
+        # The tool should not flood output with generic Rust/library words.
+        before = code[max(0,off-96):off]
+        after = code[end:min(len(code),end+96)]
+        surrounding = before+code[off:end]+after
+        nearby_updater = any(marker in surrounding.lower() for marker in
+                             (b'src\\updater.rs', b'src/updater.rs', b'ledger.conf',
+                              b'config.txt', b'/updater', b'/check'))
+        if not nearby_updater:
+            continue
+        if len(value) > 48 or '/' in value or '.' in value:
+            continue
+        output.append({'fragment': value, 'va': f'0x{pe.offset_to_va(off):X}',
+                       'file_offset': f'0x{off:X}',
+                       'referenced_from': [f'0x{x:X}' for x in sorted(by_offset[off])[:3]],
+                       'evidence': 'RIP-relative code reference into packed printable data',
+                       'context_updater': nearby_updater})
+    # De-duplicate, cap pathological binaries.
+    return output[:max_anchors]
+
+
+def discover_plaintext_network_candidates(pe: PortableExecutable) -> dict:
+    """Rank candidate host *stems* and nearby path fragments without known IOCs.
+
+    DNS TLDs and complete paths are not asserted from adjacency alone.
+    An optional .com suggestion is clearly speculative, not a static URL.
+    """
+    fragments = discover_packed_network_fragments(pe)
+    hosts = []
+    for frag in fragments:
+        text = frag['fragment']
+        off = int(frag['file_offset'],16)
+        # An update-themed string *directly adjacent* to an updater source
+        # marker is an unusually strong stem candidate. Also accept complete
+        # domains if discovered within the fragments themselves.
+        suffix = pe.data[off+len(text):off+len(text)+32].lower()
+        if not (suffix.startswith(b'src\\updater.rs') or suffix.startswith(b'src/updater.rs')
+                or ('.' in text and len(text) >= 8)):
+            continue
+        if text.startswith(('src','http')) or len(text) < 7:
+            continue
+        hosts.append({**frag,
+          'candidate_host_stem':text.lower(),
+          'confidence':'moderate (network-adjacent code-referenced stem, suffix not verified)',
+          'possible_hostname':text.lower()+'.com' if '.' not in text else text.lower(),
+          'possible_hostname_status':'heuristic suffix inference, NOT statically reconstructed'
+                if '.' not in text else 'literal domain fragment'})
+    # Only collect path-token possibilities from the same data neighborhood.
+    routes=[]
+    for h in hosts:
+        off=int(h['file_offset'],16)
+        for frag in fragments:
+            o=int(frag['file_offset'],16)
+            name=frag['fragment']
+            if 0 < o-off <= 144 and 4 <= len(name) <= 12 and name.islower() and name.isalpha():
+                if name.lower() not in {'stable','windows','standard','notice','software','zavren','moval'}:
+                    routes.append(frag)
+    routes=list({x['file_offset']:x for x in routes}.values())
+    return {'host_candidates':hosts,'nearby_path_fragments':routes[:30],
+            'assessment':'Unverified static candidates; not confirmed C2 or complete URLs'}
+
+
+
+
+def discover_rust_url_triples(pe: PortableExecutable) -> list[dict]:
+    """Find code-built [(&str ptr,len);3] URL configuration arrays.
+
+    Recognizes RIP-relative LEA into RCX/R8, immediate length stores, and
+    matching pointer stores into a common RAX-allocated 48-byte object.
+    This is evidence-backed static reconstruction, not a hostname dictionary.
+    It intentionally does not attempt to infer route semantics.
+    """
+    data = pe.data
+    triples = []
+    seen = set()
+    for lo, hi in pe.executable_ranges():
+        # Search for the first RIP-relative scheme load; bound analysis to 120 bytes.
+        for off in range(lo, hi-7):
+            rex, op, modrm = data[off:off+3]
+            if (rex, op, modrm) not in ((0x48,0x8D,0x0D),(0x4C,0x8D,0x05)):
+                continue
+            va = pe.offset_to_va(off) + 7 + struct.unpack_from('<i',data,off+3)[0]
+            try:
+                if pe.read_va(va,5) not in (b'https',):
+                    if pe.read_va(va,4) != b'http':
+                        continue
+                scheme = 'https' if pe.read_va(va,5) == b'https' else 'http'
+            except PEFormatError:
+                continue
+            # Decode the small subset of opcodes required to track the original
+            # constant-pointer array; do not treat random printable adjacency
+            # as an endpoint.
+            regs = {'rcx':va} if modrm == 0x0D else {'r8':va}
+            ptrs, lens = {}, {}
+            end = min(off+128, hi)
+            i = off+7
+            while i < end:
+                b = data
+                # lea rcx/r8, [rip+disp32]
+                if i+7 <= end and tuple(b[i:i+3]) in ((0x48,0x8D,0x0D),(0x4C,0x8D,0x05)):
+                    reg = 'rcx' if b[i+2]==0x0D else 'r8'
+                    regs[reg]=pe.offset_to_va(i)+7+struct.unpack_from('<i',b,i+3)[0]
+                    i+=7; continue
+                # mov [rax(+disp8)], rcx/r8
+                if i+3 <= end and tuple(b[i:i+3]) in ((0x48,0x89,0x08),(0x4C,0x89,0x00)):
+                    reg = 'rcx' if b[i]==0x48 else 'r8'
+                    if reg in regs: ptrs[0]=regs[reg]
+                    i+=3; continue
+                if i+4 <= end and b[i:i+3] in (b'\x48\x89\x48',b'\x4c\x89\x40'):
+                    reg='rcx' if b[i]==0x48 else 'r8'
+                    if reg in regs and (reg != 'rcx' or 'rcx_imm' not in regs): ptrs[b[i+3]]=regs[reg]
+                    elif reg == 'rcx' and 'rcx_imm' in regs: lens[b[i+3]]=regs['rcx_imm']
+                    i+=4; continue
+                # mov qword ptr [rax(+disp8)], imm32 (sign extended)
+                if i+7<=end and b[i:i+3]==b'\x48\xc7\x40':
+                    lens[b[i+3]]=struct.unpack_from('<I',b,i+4)[0]
+                    i+=8; continue
+                if i+7<=end and b[i:i+3]==b'\x48\xc7\x00':
+                    lens[0]=struct.unpack_from('<I',b,i+3)[0]
+                    i+=7; continue
+                # mov ecx, imm32 then mov [rax+disp8], rcx, seen in variants
+                if i+5<=end and b[i]==0xB9:
+                    regs['rcx_imm']=struct.unpack_from('<I',b,i+1)[0]
+                    i+=5; continue
+                if i+4<=end and b[i:i+3]==b'\x48\x89\x48' and 'rcx_imm' in regs:
+                    lens[b[i+3]]=regs['rcx_imm']; i+=4; continue
+                i+=1
+                if all(k in ptrs and k+8 in lens for k in (0,16,32)):
+                    break
+            if not all(k in ptrs and k+8 in lens for k in (0,16,32)):
+                continue
+            items=[]
+            for delta in (0,16,32):
+                n=lens[delta+8]
+                if not 1<=n<=100: break
+                try:
+                    raw=pe.read_va(ptrs[delta],n)
+                    val=raw.decode('ascii')
+                except (PEFormatError,UnicodeDecodeError): break
+                if not all(32<=x<127 for x in raw): break
+                items.append({'value':val,'va':f'0x{ptrs[delta]:X}','length':n})
+            if len(items)!=3 or items[0]['value']!=scheme: continue
+            stem,tld=items[1]['value'],items[2]['value']
+            if not re.fullmatch(r'[a-z0-9-]{3,63}',stem) or not re.fullmatch(r'[a-z]{2,24}',tld):
+                continue
+            domain=f'{stem}.{tld}'
+            key=(off,domain)
+            if key in seen: continue
+            seen.add(key)
+            triples.append({'url_base':f'{scheme}://{domain}', 'domain':domain,
+                            'reference_va':f'0x{pe.offset_to_va(off):X}',
+                            'elements':items,
+                            'evidence':'code-defined 3x ptr/length string array (scheme, stem, suffix)',
+                            'status':'static hostname reconstruction; network contact/C2 not proven'})
+    return triples[:100]
+
 def static_indicators(pe: PortableExecutable) -> dict:
     """Conservative role triage based on raw embedded literal evidence."""
     # PE import names and Rust packed strings may have no NUL terminators.
@@ -707,6 +953,7 @@ def static_indicators(pe: PortableExecutable) -> dict:
         "task_indicators": tasks,
         "network_api_name_strings": network,
         "plaintext_urls": plaintext_urls(pe),
+        "packed_plaintext_artifacts": packed_plaintext_artifacts(pe),
     }
 
 
@@ -831,9 +1078,36 @@ def find_xor_decoder_calls(pe: PortableExecutable, max_fragment: int = 64) -> tu
     return all_hits, list(domains.values())
 
 
+def corroborate_observed_domains(pe: PortableExecutable, domains: list[str]) -> list[dict]:
+    """Correlate separately observed DNS names with plaintext substrings.
+
+    A matching stem is not proof of a particular request or code reference.
+    """
+    results = []
+    for raw in domains:
+        host = raw.lower().strip().rstrip('.')
+        if not re.fullmatch(r'[a-z0-9-]+(?:\.[a-z0-9-]+)+', host):
+            raise ValueError(f'invalid domain: {raw!r}')
+        stem = host.split('.')[0].encode('ascii')
+        for sec in pe.sections:
+            if sec.characteristics & IMAGE_SCN_MEM_EXECUTE:
+                continue
+            start, end = sec.raw_offset, min(sec.raw_offset+sec.raw_size,len(pe.data))
+            search = start
+            while search < end:
+                off = pe.data.find(stem,search,end)
+                if off < 0: break
+                results.append({'observed_domain':host,'matched_stem':stem.decode(),
+                    'va':f'0x{pe.offset_to_va(off):X}','file_offset':f'0x{off:X}',
+                    'surrounding_hex':pe.data[max(start,off-16):min(end,off+len(stem)+48)].hex(' '),
+                    'evidence':'runtime-observed hostname stem in raw static data; no decoder inferred'})
+                search=off+1
+    return results
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Defogger v5.1: rolling-additive (including split Rust ABI) and code-referenced XOR for x64 PEs."
+        description="Defogger v5.3: rolling-additive (including split Rust ABI) and code-referenced XOR for x64 PEs."
     )
     parser.add_argument("sample", type=Path, help="Path to the PE sample")
     parser.add_argument(
@@ -880,6 +1154,8 @@ def main() -> int:
     parser.add_argument("--bruteforce-windows", type=int, default=24,
                         help="Maximum code-referenced buffers for exhaustive search (default: 24)")
     parser.add_argument("--no-auto-xor", action="store_true", help="Disable automatic code-referenced XOR decoder discovery")
+    parser.add_argument("--observed-domain", action="append", default=[],
+                        help="Runtime-observed domain; locate its matching plaintext stem in packed data (repeatable)")
     parser.add_argument("--json", action="store_true", help="Emit JSON")
     args = parser.parse_args()
 
@@ -911,6 +1187,12 @@ def main() -> int:
         xor_hits, xor_endpoints = (find_xor_decoder_calls(pe, args.max_fragment)
                                    if not args.no_auto_xor else ([], []))
         indicators = static_indicators(pe)
+        packed_candidates = discover_plaintext_network_candidates(pe)
+        static_url_triples = discover_rust_url_triples(pe)
+        verified_domains = {x['domain'] for x in static_url_triples}
+        packed_candidates['host_candidates'] = [h for h in packed_candidates['host_candidates']
+            if h['possible_hostname'] not in verified_domains]
+        observed_stems = corroborate_observed_domains(pe,args.observed_domain)
         bruteforce_hits = (brute_force_additive(pe, args.bruteforce_windows)
                            if args.bruteforce_additive else [])
         profile_fragments = [
@@ -949,6 +1231,9 @@ def main() -> int:
             "sample": str(args.sample),
             "image_base": f"0x{pe.image_base:X}",
             "classification": indicators,
+            "observed_domain_matches": observed_stems,
+            "auto_packed_network_candidates": packed_candidates,
+            "static_url_configurations": static_url_triples,
             "additive_decoder": {
                 "status": "fragments found" if fragments else (
                     "decoder found; no compatible call fragments" if profiles else "not identified"
@@ -981,6 +1266,30 @@ def main() -> int:
     ):
         if indicators[key]:
             print(f"\n{label}: {', '.join(indicators[key])}")
+    if static_url_triples:
+        print("\nCode-constructed URL bases (no known domain required):")
+        for item in static_url_triples:
+            print(f"  {item['url_base']} [scheme/stem/suffix from code at {item['reference_va']}]")
+            print("    " + ", ".join(f"{e['value']!r} ({e['length']} bytes at {e['va']})" for e in item['elements']))
+            print("    Static reconstruction; contact/C2 not proven")
+    if packed_candidates['host_candidates']:
+        print("\nAutomatic packed-network hostname candidates (no known domain required):")
+        for h in packed_candidates['host_candidates']:
+            print(f"  {h['candidate_host_stem']} [stem] at {h['va']} "
+                  f"(file {h['file_offset']})")
+            print(f"    possible: {h['possible_hostname']} ({h['possible_hostname_status']})")
+        if packed_candidates['nearby_path_fragments']:
+            print("  Nearby separately code-referenced fragments (paths NOT verified):")
+            for f in packed_candidates['nearby_path_fragments']:
+                print(f"    {f['fragment']!r} at {f['va']}")
+    if observed_stems:
+        print("\nMatches for externally observed domains (plaintext stem only):")
+        for item in observed_stems:
+            print(f"  {item['observed_domain']}: {item['matched_stem']} at {item['va']} (file {item['file_offset']})")
+    if indicators["packed_plaintext_artifacts"]:
+        print("\nEmbedded plaintext domain candidates (may be packed Rust literals):")
+        for item in indicators["packed_plaintext_artifacts"]:
+            print(f"  {item['value']} at {item['va']} (file {item['file_offset']})")
     if indicators["plaintext_urls"]:
         print("\nEmbedded plaintext URL candidates (not confirmed C2):")
         for url in indicators["plaintext_urls"]:
@@ -1039,4 +1348,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
